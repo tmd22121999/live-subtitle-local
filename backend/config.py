@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    whisper_cli: str = os.getenv('WHISPER_CLI', r'D:\whisper.cpp\build\bin\Release\whisper-cli.exe')
-    whisper_model: str = os.getenv('WHISPER_MODEL', r'D:\whisper.cpp\models\ggml-small.bin')
+    whisper_cli: str = os.getenv('WHISPER_CLI', r'\whisper.cpp\build\bin\Release\whisper-cli.exe')
+    whisper_model: str = os.getenv('WHISPER_MODEL', r'\whisper.cpp\models\ggml-small.bin')
     translation_model: str = os.getenv('TRANSLATION_MODEL', 'facebook/nllb-200-distilled-600M')
     refine_url: str = os.getenv('REFINE_URL', 'http://127.0.0.1:8080/v1/chat/completions')
     refine_model: str = os.getenv('REFINE_MODEL', 'local')
