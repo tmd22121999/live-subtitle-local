@@ -1,0 +1,133 @@
+# ==========================================
+# Python
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ==========================================
+# Environment & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+!.env.template
+*.local
+
+# ==========================================
+# AI Models & Weights
+# ==========================================
+models/
+checkpoints/
+weights/
+*.gguf
+*.ggml
+*.safetensors
+*.onnx
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Hugging Face / Transformers cache
+.cache/
+huggingface/
+transformers_cache/
+hub/
+
+# ==========================================
+# Audio / Video / Temporary Files
+# ==========================================
+tmp/
+temp/
+cache/
+recordings/
+captures/
+output/
+outputs/
+
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.mp4
+*.mkv
+*.webm
+
+# Generated subtitles
+*.srt
+*.vtt
+*.ass
+
+# ==========================================
+# Node.js / Chrome Extension
+# ==========================================
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage/
+.vite/
+.next/
+.turbo/
+
+# ==========================================
+# IDE / Editor
+# ==========================================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==========================================
+# Logs
+# ==========================================
+*.log
+logs/
+
+# ==========================================
+# Local Databases
+# ==========================================
+*.sqlite
+*.sqlite3
+*.db
+
+# ==========================================
+# Local Settings
+# ==========================================
+config.local.json
+settings.local.json
+secrets.json
+
+# ==========================================
+# Testing / Benchmark
+# ==========================================
+.tox/
+.nox/
+hypothesis/
+benchmark_results/
