@@ -1,4 +1,28 @@
-"""Offline STT -> multilingual translation -> optional bounded refinement."""
+"""Offline STT -> multilingual translation -> optional bounded refinement.
+
+Architectural Notes & Documented Limitations:
+---------------------------------------------
+1. Whisper Model Loading Overhead vs Persistent Inference:
+   Currently, WhisperCLI invokes `whisper-cli.exe` per audio segment via `subprocess.run`.
+   Each execution must initialize the C++ runtime, Vulkan compute device, and reload the
+   GGML model weights (~460MB for small) from disk/page cache. This introduces a baseline
+   overhead of approximately 200ms - 800ms per audio segment.
+   Persistent inference alternatives:
+   - Run whisper.cpp's `whisper-server` (built-in HTTP/streaming endpoint) to keep model
+     weights resident in GPU VRAM and stream segments or post WAV buffers.
+   - Use in-process C-bindings (e.g. pywhispercpp).
+   In this release, subprocess invocation is preserved for compatibility without major
+   architecture replacement, but explicit source language specification (`-l <lang>`)
+   eliminates Whisper's costly internal language identification pass when fixed mode is chosen.
+
+2. Chinese Script Handling Limitations:
+   Whisper speech recognition for Chinese (`zh`) may produce either Simplified Chinese
+   (zh-CN) or Traditional Chinese (zh-TW, zh-HK) depending on the audio characteristics
+   and vocabulary. NLLB-200 maps `zh` to `zho_Hans` (Simplified Chinese script).
+   If Whisper transcribes Traditional Chinese characters, NLLB's tokenizer may encounter
+   unfamiliar tokens or produce degraded translations unless converted to Simplified
+   Chinese (e.g. via OpenCC) beforehand.
+"""
 import asyncio
 import json
 import os
@@ -6,6 +30,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
 from collections import deque
 from pathlib import Path
@@ -14,19 +39,53 @@ import httpx
 import numpy as np
 from config import CFG
 
-# Whisper language -> NLLB language. Unmapped languages are rejected explicitly.
-LANGS = {'en':'eng_Latn','ja':'jpn_Jpan','ko':'kor_Hang','zh':'zho_Hans',
-         'fr':'fra_Latn','de':'deu_Latn','es':'spa_Latn','ru':'rus_Cyrl',
-         'th':'tha_Thai','id':'ind_Latn','vi':'vie_Latn','pt':'por_Latn',
-         'it':'ita_Latn','ar':'arb_Arab','hi':'hin_Deva','tr':'tur_Latn',
-         'pl':'pol_Latn','nl':'nld_Latn','uk':'ukr_Cyrl'}
+# Centralized Whisper language code -> NLLB language code mapping.
+LANGUAGE_MAP = {
+    "ja": "jpn_Jpan",
+    "en": "eng_Latn",
+    "ko": "kor_Hang",
+    "zh": "zho_Hans",
+    "fr": "fra_Latn",
+    "es": "spa_Latn",
+    "vi": "vie_Latn",
+}
+
+# Alias for backwards compatibility with existing modules/tests
+LANGS = LANGUAGE_MAP
+
+# Valid source languages selectable by the client
+SUPPORTED_SOURCE_LANGUAGES = {"auto", "ja", "en", "ko", "zh", "fr", "es", "vi"}
+
+
+def validate_source_language(lang: str) -> bool:
+    """Validate whether a language code is an accepted source language."""
+    return isinstance(lang, str) and lang.lower() in SUPPORTED_SOURCE_LANGUAGES
+
 
 class WhisperCLI:
     def __init__(self, cli=None, model=None):
         self.cli = cli or CFG.whisper_cli
         self.model = model or CFG.whisper_model
 
-    def _transcribe(self, samples):
+    def build_cmd(self, wav_path: Path, output_path: Path, language: str = 'auto') -> list[str]:
+        """Generate safe command array for whisper-cli invocation."""
+        lang = (language or 'auto').lower()
+        if lang != 'auto' and lang not in LANGUAGE_MAP:
+            raise ValueError(f'Unsupported language for transcription: {lang}')
+        return [
+            self.cli,
+            '-m', self.model,
+            '-f', str(wav_path),
+            '-oj',
+            '-of', str(output_path),
+            '-l', lang,
+            '-nt',
+        ]
+
+    def _transcribe(self, samples, language='auto'):
+        lang = (language or 'auto').lower()
+        if lang != 'auto' and lang not in LANGUAGE_MAP:
+            raise ValueError(f'Unsupported language for transcription: {lang}')
         if not shutil.which(self.cli):
             raise RuntimeError('whisper-cli not found. Set WHISPER_CLI to the full path of whisper-cli.exe.')
         if not Path(self.model).is_file():
@@ -34,22 +93,31 @@ class WhisperCLI:
         with tempfile.TemporaryDirectory() as directory:
             wav = Path(directory) / 'segment.wav'
             with wave.open(str(wav), 'wb') as f:
-                f.setnchannels(1); f.setsampwidth(2); f.setframerate(CFG.sample_rate)
+                f.setnchannels(1)
+                f.setsampwidth(2)
+                f.setframerate(CFG.sample_rate)
                 f.writeframes((np.clip(samples, -1, 1) * 32767).astype('<i2').tobytes())
             output = Path(directory) / 'result'
-            proc = subprocess.run([self.cli, '-m', self.model, '-f', str(wav),
-                '-oj', '-of', str(output), '-l', 'auto', '-nt'],
-                capture_output=True, text=True, timeout=90, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            cmd = self.build_cmd(wav, output, language=lang)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            )
             if proc.returncode:
                 raise RuntimeError(f'whisper.cpp failed: {proc.stderr[-500:]}')
             data = json.loads(output.with_suffix('.json').read_text(encoding='utf-8'))
             text = ' '.join(s.get('text', '').strip() for s in data.get('transcription', []))
             # whisper.cpp JSON uses result.language in current releases.
-            lang = data.get('result', {}).get('language', 'auto')
-            return text.strip(), lang
+            detected = data.get('result', {}).get('language', 'auto')
+            actual_lang = lang if lang != 'auto' else (detected or 'auto')
+            return text.strip(), actual_lang
 
-    async def transcribe(self, samples):
-        return await asyncio.to_thread(self._transcribe, samples)
+    async def transcribe(self, samples, language='auto'):
+        return await asyncio.to_thread(self._transcribe, samples, language)
+
 
 class NLLBTranslator:
     def __init__(self, model_name=None):
@@ -66,12 +134,13 @@ class NLLBTranslator:
             self.model.eval()
 
     def _translate(self, text, language):
-        self._load()
-        src = LANGS.get(language)
-        if not src:
-            raise ValueError(f'Unsupported language: {language}')
+        # Vietnamese translation bypass: preserve original transcribed text
         if language == 'vi':
             return text
+        src = LANGUAGE_MAP.get(language)
+        if not src:
+            raise ValueError(f'Unsupported language: {language}')
+        self._load()
         import torch
         self.tokenizer.src_lang = src
         batch = self.tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
@@ -83,6 +152,7 @@ class NLLBTranslator:
     async def translate(self, text, language):
         async with self.lock:
             return await asyncio.to_thread(self._translate, text, language)
+
 
 class AdaptiveRefiner:
     def __init__(self, url=None, timeout=None):
@@ -110,13 +180,21 @@ class AdaptiveRefiner:
             return False
         return True
 
-    async def refine(self, source, raw, language, context):
+    async def refine(self, source, raw, language, context, glossary=None):
         if not CFG.refine_enabled or not self.should_refine(source, raw, context):
+            return raw, False
+        # Vietnamese bypass: do not hallucinate or alter original Vietnamese transcription
+        # unless an explicit cleanup feature is enabled
+        if language == 'vi' and not getattr(CFG, 'vietnamese_cleanup_enabled', False):
             return raw, False
         system = ('Bạn biên tập phụ đề tiếng Việt. Giữ nguyên nghĩa câu gốc, tên riêng, '
                   'số và sắc thái; viết tự nhiên, ngắn, không tự thêm nội dung. '
                   'Nếu bản dịch đã ổn, giữ nguyên. Chỉ xuất câu phụ đề tiếng Việt.')
-        user = f'Ngôn ngữ: {language}\nCâu gốc: {source}\nDịch thô: {raw}\nNgữ cảnh trước: {" | ".join(context[-3:])}'
+        context_str = " | ".join(context[-3:]) if context else ""
+        user = f'Ngôn ngữ: {language}\nCâu gốc: {source}\nDịch thô: {raw}\nNgữ cảnh trước: {context_str}'
+        if glossary:
+            glossary_str = ", ".join(f"{k} -> {v}" for k, v in glossary.items())
+            user += f'\nThuật ngữ: {glossary_str}'
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.post(self.url, json={'model': CFG.refine_model,
@@ -130,21 +208,66 @@ class AdaptiveRefiner:
             pass
         return raw, False
 
+
 class Pipeline:
-    def __init__(self, stt=None, translator=None, refiner=None):
+    def __init__(self, stt=None, translator=None, refiner=None, glossary=None):
         self.stt = stt or WhisperCLI()
         self.translator = translator or NLLBTranslator()
         self.refiner = refiner or AdaptiveRefiner()
+        self.glossary = glossary or {}
         self.context = deque(maxlen=5)
 
-    async def process(self, samples):
-        source, language = await self.stt.transcribe(samples)
+    async def process(self, samples, source_language='auto'):
+        t_start = time.perf_counter()
+
+        # 1. Speech-to-text
+        t_stt = time.perf_counter()
+        source, language = await self.stt.transcribe(samples, language=source_language)
+        stt_ms = round((time.perf_counter() - t_stt) * 1000, 1)
+
         if not source:
             return None
-        if language not in LANGS:
-            return {'error':f'Language {language} is not configured', 'source':source}
+
+        # Check if detected or configured language is supported by translation mapping
+        if language not in LANGUAGE_MAP:
+            total_ms = round((time.perf_counter() - t_start) * 1000, 1)
+            return {
+                'error': f'Language {language} is not supported',
+                'source': source,
+                'language': language,
+                'metrics': {
+                    'stt_ms': stt_ms,
+                    'translation_ms': 0.0,
+                    'refinement_ms': 0.0,
+                    'total_ms': total_ms,
+                }
+            }
+
+        # 2. Translation
+        t_trans = time.perf_counter()
         raw = await self.translator.translate(source, language)
-        result, refined = await self.refiner.refine(source, raw, language, list(self.context))
+        trans_ms = round((time.perf_counter() - t_trans) * 1000, 1)
+
+        # 3. Adaptive Refinement
+        t_refine = time.perf_counter()
+        result, refined = await self.refiner.refine(
+            source, raw, language, list(self.context), glossary=self.glossary
+        )
+        refine_ms = round((time.perf_counter() - t_refine) * 1000, 1)
+
         self.context.append(f'{source} => {result}')
-        return {'source':source, 'language':language, 'raw_vi':raw,
-                'text_vi':result, 'refined':refined}
+        total_ms = round((time.perf_counter() - t_start) * 1000, 1)
+
+        return {
+            'source': source,
+            'language': language,
+            'raw_vi': raw,
+            'text_vi': result,
+            'refined': refined,
+            'metrics': {
+                'stt_ms': stt_ms,
+                'translation_ms': trans_ms,
+                'refinement_ms': refine_ms,
+                'total_ms': total_ms,
+            }
+        }

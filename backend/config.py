@@ -14,6 +14,7 @@ class Config:
     max_segment_seconds: float = float(os.getenv('MAX_SEGMENT_SECONDS', '6'))
     silence_seconds: float = float(os.getenv('SILENCE_SECONDS', '0.65'))
     energy_threshold: float = float(os.getenv('ENERGY_THRESHOLD', '0.012'))
+    vietnamese_cleanup_enabled: bool = os.getenv('VIETNAMESE_CLEANUP_ENABLED', 'false').lower() == 'true'
     sample_rate: int = 16000
 
 CFG = Config()

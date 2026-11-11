@@ -7,7 +7,7 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from config import CFG
-from pipeline import Pipeline
+from pipeline import Pipeline, validate_source_language
 
 app = FastAPI(title='Local Live Subtitle Translator')
 # Local-only server. WebSocket additionally checks origin; do not expose to LAN.
@@ -44,6 +44,42 @@ class Segmenter:
             return output if valid else None
         return None
 
+class TranslationSession:
+    """Manages active translation session state, segmenting, and dynamic language configuration."""
+    def __init__(self, pipeline=None, segmenter=None):
+        self.pipeline = pipeline or Pipeline()
+        self.segmenter = segmenter or Segmenter()
+        self.source_language = 'auto'
+
+    def handle_text_message(self, text: str) -> dict | None:
+        """Handle incoming JSON text message. Returns response dict if an error occurred."""
+        try:
+            msg = json.loads(text)
+        except Exception:
+            return None
+        msg_type = msg.get('type')
+        if msg_type == 'reset':
+            self.segmenter = Segmenter()
+            self.pipeline.context.clear()
+            return None
+        elif msg_type == 'config':
+            lang = msg.get('source_language')
+            if lang is not None:
+                if validate_source_language(lang):
+                    self.source_language = lang.lower()
+                    return None
+                else:
+                    return {'type': 'error', 'message': f'Invalid source_language: {lang}'}
+        return None
+
+    def handle_audio_chunk(self, samples: np.ndarray) -> tuple[np.ndarray, str] | None:
+        """Feed audio chunk into segmenter. If segment is complete, returns (segment, language)."""
+        segment = self.segmenter.feed(samples)
+        if segment is not None:
+            # Tag segment with current source_language atomically
+            return (segment, self.source_language)
+        return None
+
 @app.websocket('/ws')
 async def ws_audio(ws: WebSocket):
     origin = ws.headers.get('origin', '')
@@ -51,20 +87,24 @@ async def ws_audio(ws: WebSocket):
         await ws.close(code=1008)
         return
     await ws.accept()
-    pipeline = Pipeline()
-    segmenter = Segmenter()
+    session = TranslationSession()
     work = asyncio.Queue(maxsize=2)
+
     async def worker():
         while True:
-            segment = await work.get()
             try:
-                result = await pipeline.process(segment)
+                segment, seg_lang = await work.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                result = await session.pipeline.process(segment, source_language=seg_lang)
                 if result:
                     await ws.send_json({'type':'subtitle', **result, 'timestamp':time.time()})
             except Exception as exc:
                 await ws.send_json({'type':'error','message':str(exc)[:300]})
             finally:
                 work.task_done()
+
     task = asyncio.create_task(worker())
     try:
         while True:
@@ -72,10 +112,9 @@ async def ws_audio(ws: WebSocket):
             if packet['type'] == 'websocket.disconnect':
                 break
             if packet.get('text'):
-                msg = json.loads(packet['text'])
-                if msg.get('type') == 'reset':
-                    segmenter = Segmenter()
-                    pipeline.context.clear()
+                err = session.handle_text_message(packet['text'])
+                if err:
+                    await ws.send_json(err)
                 continue
             binary = packet.get('bytes')
             if not binary or len(binary) % 4:
@@ -83,15 +122,20 @@ async def ws_audio(ws: WebSocket):
             samples = np.frombuffer(binary, dtype='<f4').copy()
             if len(samples) > 16000 * 2:
                 continue
-            segment = segmenter.feed(samples)
-            if segment is not None:
+            item = session.handle_audio_chunk(samples)
+            if item is not None:
                 if work.full():
-                    try: work.get_nowait(); work.task_done()
-                    except asyncio.QueueEmpty: pass
-                work.put_nowait(segment)
+                    try:
+                        work.get_nowait()
+                        work.task_done()
+                    except asyncio.QueueEmpty:
+                        pass
+                work.put_nowait(item)
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
         task.cancel()
-        try: await task
-        except asyncio.CancelledError: pass
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
