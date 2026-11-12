@@ -106,13 +106,27 @@ llama-server.exe -m C:\models\qwen3-1.7b-q4.gguf --host 127.0.0.1 --port 8080 -n
 
 Then restart backend with `$env:REFINE_ENABLED='true'`. The refiner sends source, raw translation, language, previous dialogue context, and optional glossary to the local OpenAI-compatible API. It only runs when a simple heuristic finds a reason. On timeout, bad response, or validation failure it falls back to raw translation. The `REFINE_TIMEOUT` default is 1.5 seconds, **not** a measured GPU latency.
 
+## Chọn model dịch Ollama
+
+Chạy Ollama, dùng `ollama list` để xem tên model đã cài, rồi đặt tên đầy đủ (kèm tag) trước khi khởi động backend. Ví dụ từ thư mục gốc của dự án:
+
+```powershell
+$env:OLLAMA_TRANSLATION_MODEL = 'qwen2.5:7b-instruct'
+.\run.bat
+```
+
+Để đổi model, sửa giá trị và khởi động lại backend. Để quay về NLLB, chạy `Remove-Item Env:OLLAMA_TRANSLATION_MODEL` trước khi khởi động lại. Model dịch có cấu hình riêng với model chỉnh câu `REFINE_MODEL`.
+
 ## Configuration & Environment Variables
 
 - `WHISPER_CLI`: Path to `whisper-cli.exe`.
 - `WHISPER_MODEL`: Path to `ggml-*.bin` model file.
-- `TRANSLATION_MODEL`: NLLB model identifier (default: `facebook/nllb-200-distilled-600M`).
+- `TRANSLATION_MODEL`: NLLB model identifier (default: `facebook/nllb-200-distilled-1.3B`).
+- `OLLAMA_TRANSLATION_MODEL`: Ollama model name and tag for primary translation (empty by default, which uses NLLB).
+- `OLLAMA_TRANSLATION_URL`: Chat completions endpoint for translation (default: `http://127.0.0.1:11434/v1/chat/completions`).
+- `OLLAMA_TRANSLATION_TIMEOUT`: Timeout in seconds for Ollama translation requests (default: `30`).
 - `REFINE_URL`: Endpoint for refinement LLM (default: `http://127.0.0.1:8080/v1/chat/completions`).
-- `REFINE_MODEL`: Model name for refiner (default: `local`).
+- `REFINE_MODEL`: Model name for refiner (default: `qwen2.5:7b-instruct`).
 - `REFINE_ENABLED`: Enable/disable refinement stage (`true`/`false`).
 - `REFINE_TIMEOUT`: Timeout in seconds for refinement requests (default: `1.5`).
 - `ENERGY_THRESHOLD`: RMS speech threshold for segmenter (default: `0.012`).

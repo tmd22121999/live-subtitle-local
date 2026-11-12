@@ -154,6 +154,36 @@ class NLLBTranslator:
             return await asyncio.to_thread(self._translate, text, language)
 
 
+class OllamaTranslator:
+    def __init__(self, model_name):
+        self.model_name = model_name
+
+    async def translate(self, text, language):
+        if language == 'vi':
+            return text
+
+        system = (f'Translate the following subtitle from language code {language} into natural Vietnamese. '
+                  'Preserve meaning, names, and numbers. Return only the Vietnamese subtitle.')
+        try:
+            async with httpx.AsyncClient(timeout=CFG.ollama_translation_timeout) as client:
+                response = await client.post(CFG.ollama_translation_url, json={
+                    'model': self.model_name,
+                    'messages': [
+                        {'role': 'system', 'content': system},
+                        {'role': 'user', 'content': text},
+                    ],
+                    'stream': False,
+                })
+                response.raise_for_status()
+                translation = response.json()['choices'][0]['message']['content']
+        except (httpx.HTTPError, KeyError, ValueError, IndexError, TypeError) as exc:
+            raise RuntimeError(f'Ollama translation failed for {self.model_name}: {exc}') from exc
+
+        if not isinstance(translation, str) or not translation.strip():
+            raise RuntimeError(f'Ollama returned an empty subtitle for {self.model_name}')
+        return translation.strip()
+
+
 class AdaptiveRefiner:
     def __init__(self, url=None, timeout=None):
         self.url = url or CFG.refine_url
@@ -199,12 +229,14 @@ class AdaptiveRefiner:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 r = await client.post(self.url, json={'model': CFG.refine_model,
                     'messages': [{'role':'system','content':system},{'role':'user','content':user}],
-                    'temperature':0.1,'max_tokens':100,'stream':False})
+                    'temperature':0.1,'max_tokens':256,'stream':False})
                 r.raise_for_status()
                 candidate = r.json()['choices'][0]['message']['content'].strip().strip('"')
             if self.safe(candidate, raw):
                 return candidate, candidate != raw
-        except (httpx.HTTPError, KeyError, ValueError, IndexError):
+        except (httpx.HTTPError, KeyError, ValueError, IndexError) as e:
+            print(f"[ERROR] {type(e).__name__}: {e}")
+            traceback.print_exc()
             pass
         return raw, False
 
@@ -212,7 +244,10 @@ class AdaptiveRefiner:
 class Pipeline:
     def __init__(self, stt=None, translator=None, refiner=None, glossary=None):
         self.stt = stt or WhisperCLI()
-        self.translator = translator or NLLBTranslator()
+        self.translator = translator or (
+            OllamaTranslator(CFG.ollama_translation_model)
+            if CFG.ollama_translation_model else NLLBTranslator()
+        )
         self.refiner = refiner or AdaptiveRefiner()
         self.glossary = glossary or {}
         self.context = deque(maxlen=5)

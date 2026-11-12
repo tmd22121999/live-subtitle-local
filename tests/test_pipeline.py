@@ -4,6 +4,7 @@ from collections import deque
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import numpy as np
 import pytest
 
@@ -21,6 +22,37 @@ from pipeline import (
     WhisperCLI,
     validate_source_language,
 )
+
+
+@pytest.mark.parametrize('language, source, expected', [
+    ('en', 'See you tomorrow.', 'Hẹn gặp lại ngày mai.'),
+    ('vi', 'Chào bạn.', 'Chào bạn.'),
+])
+def test_pipeline_uses_configured_ollama_translation_model(monkeypatch, language, source, expected):
+    monkeypatch.setattr(CFG, 'ollama_translation_model', 'custom/subtitles:local', raising=False)
+    monkeypatch.setattr(CFG, 'refine_enabled', False)
+    stt = MagicMock()
+    stt.transcribe = AsyncMock(return_value=(source, language))
+    requests = []
+
+    def respond(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            'choices': [{'message': {'content': ' Hẹn gặp lại ngày mai. '}}],
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    monkeypatch.setattr(NLLBTranslator, 'translate', AsyncMock(side_effect=lambda text, lang: text))
+    with patch('pipeline.httpx.AsyncClient', return_value=client):
+        result = run_coro(Pipeline(stt=stt).process(np.zeros(1600)))
+
+    assert result['text_vi'] == expected
+    if language == 'vi':
+        assert requests == []
+    else:
+        assert len(requests) == 1
+        assert requests[0]['model'] == 'custom/subtitles:local'
+        assert requests[0]['messages'][-1]['content'] == source
 
 
 def run_coro(coro):
